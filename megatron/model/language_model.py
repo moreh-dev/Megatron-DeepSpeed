@@ -288,6 +288,57 @@ class EmbeddingPipe(Embedding):
         """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
         return self.word_embeddings.weight
 
+class EmbeddingPipeEnc(Embedding):
+
+    def forward(self, inputs, **kwargs):
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+
+        input_ids = inputs[0]
+        position_ids = inputs[1]
+        dec_input_ids = inputs[2]
+        dec_position_ids = inputs[3]
+        labels = inputs[4]
+        enc_mask = inputs[5]
+        dec_mask = inputs[6]
+        enc_dec_mask = inputs[7]
+
+        embeddings = super().forward(input_ids, position_ids, tokentype_ids=None)
+
+        return embeddings, enc_mask, dec_input_ids, dec_position_ids, labels, dec_mask, enc_dec_mask
+
+
+    @property
+    def enc_word_embeddings_weight(self):
+        """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
+        return self.word_embeddings.weight
+
+class EmbeddingPipeDec(Embedding):
+    '''
+    hidden, attention_mask, dec_input_ids, dec_position_ids, labels, dec_mask, enc_dec_mask
+    '''
+
+    def forward(self, inputs, **kwargs):
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+
+        enc_output = inputs[0]
+        _ = inputs[1] # enc attention mask
+        input_ids = inputs[2]
+        position_ids = inputs[3]
+        labels = inputs[4]
+        dec_mask = inputs[5]
+        enc_dec_mask = inputs[6]
+
+        embeddings = super().forward(input_ids, position_ids, tokentype_ids=None)
+
+        return embeddings, enc_output, dec_mask, enc_dec_mask, labels
+
+    @property
+    def dec_word_embeddings_weight(self):
+        """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
+        return self.word_embeddings.weight
+
 
 class TransformerLanguageModel(MegatronModule):
     """Transformer language model.

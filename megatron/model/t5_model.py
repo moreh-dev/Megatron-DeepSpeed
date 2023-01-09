@@ -17,11 +17,12 @@
 
 import torch
 
+from deepspeed import comm as dist
 from megatron import (
     get_args,
     mpu
 )
-from megatron.model.enums import AttnMaskType
+from megatron.model.enums import AttnMaskType, LayerType
 from megatron.model.language_model import parallel_lm_logits, get_language_model
 from megatron.model.transformer import LayerNorm
 from megatron.model.utils import (
@@ -30,8 +31,11 @@ from megatron.model.utils import (
     init_method_normal,
     scaled_init_method_normal
 )
-from .module import MegatronModule
+from .module import MegatronModule, fp32_to_float16
+from .language_model import EmbeddingPipe, EmbeddingPipeEnc, EmbeddingPipeDec
+from .transformer import ParallelTransformerLayerPipe, ParallelTransformerLayerPipeEnc, ParallelTransformerLayerPipeDec
 
+from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 
 def t5_extended_attention_mask(attention_mask_list):
 
@@ -51,6 +55,40 @@ def t5_position_ids(token_ids):
     position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
 
     return position_ids
+
+class T5LMHeadPipe(MegatronModule):
+    """Masked LM head for T5
+
+    Arguments:
+        mpu_vocab_size: model parallel size of vocabulary.
+        hidden_size: hidden size
+        init_method: init method for weight initialization
+        layernorm_epsilon: tolerance for layer norm divisions
+        parallel_output: wether output logits being distributed or not.
+    """
+
+
+    def __init__(self, mpu_vocab_size, parallel_output):
+        super(T5LMHeadPipe, self).__init__()
+
+        args = get_args()
+
+        # create it's own weight and sync in every step
+        self.weight = torch.nn.Parameter(torch.randn(mpu_vocab_size, args.hidden_size))
+        self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
+        self.bias.model_parallel = True
+        self.bias.partition_dim = 0
+        self.bias.stride = 1
+        self.parallel_output = parallel_output
+
+    def forward(self, inputs):
+        # hidden, enc_output, attention_mask, enc_dec_mask, labels
+        hidden_states, _, _, _, _ = inputs
+        output = parallel_lm_logits(hidden_states,
+                                    self.weight,
+                                    self.parallel_output,
+                                    bias=self.bias)
+        return output
 
 
 class T5LMHead(MegatronModule):
@@ -132,9 +170,10 @@ class T5Model(MegatronModule):
                                         decoder_attn_mask,
                                         encoder_decoder_attn_mask,
                                         tokentype_ids=tokentype_ids,
-                                        enc_hidden_states=enc_hidden_states)
+                                        enc_hidden_states=enc_hidden_states,
+                                        output_enc_hidden=False)
 
-        decoder_output, encoder_output = lm_output
+        decoder_output, encoder_output, *moe_losses = lm_output
 
         # Output.
         lm_logits = self.lm_head(decoder_output,
@@ -172,3 +211,106 @@ class T5Model(MegatronModule):
             state_dict[self._language_model_key], strict=strict)
         self.lm_head.load_state_dict(state_dict[self._lm_head_key],
                                      strict=strict)
+
+def CrossEntropy(output, labels):
+    labels = labels[0]
+    # TODO(jeesoo): loss mask?
+
+    args = get_args()
+
+    loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
+    return loss.sum()
+
+class T5ModelPipe(PipelineModule,MegatronModule):
+    """T5 Language model."""
+
+    def __init__(self, num_tokentypes=0, parallel_output=True):
+        args = get_args()
+        self.parallel_output = parallel_output
+
+        init_method = init_method_normal(args.init_method_std)
+        scaled_init_method = scaled_init_method_normal(args.init_method_std,
+                                                       args.num_layers)
+
+        self.specs = []
+
+        '''
+        def _to_float16(inputs):
+            if args.fp16:
+                return fp32_to_float16(inputs, lambda v: v.half())
+            elif args.bf16:
+                return fp32_to_float16(inputs, lambda v: v.bfloat16())
+            else:
+                return inputs
+        self.specs.append(_to_float16)
+        '''
+
+        # encoder Embedding layer
+        self.specs.append(LayerSpec(EmbeddingPipeEnc,
+                                    args.hidden_size,
+                                    args.padded_vocab_size,
+                                    args.max_position_embeddings,
+                                    args.hidden_dropout,
+                                    init_method=init_method,
+                                    num_tokentypes=num_tokentypes))
+        #self.specs.append(self.encoder_embedding)
+
+        def transpose_hidden(x_i, i, fp32_residual_connection):
+            if i == 0:
+                if fp32_residual_connection:
+                    return x_i.transpose(0, 1).contiguous().float()
+                else:
+                    return x_i.transpose(0, 1).contiguous()
+            else:
+                return x_i
+
+        self.specs.append(lambda x: [transpose_hidden(x_i, i, args.fp32_residual_connection) for i, x_i in enumerate(x)])
+
+        # encoder
+        for layer_idx in range(args.num_layers):
+            self.specs.append(
+                LayerSpec(ParallelTransformerLayerPipeEnc,
+                    init_method=init_method,
+                    output_layer_init_method=scaled_init_method,
+                    layer_number=layer_idx,
+                    self_attn_mask_type=AttnMaskType.padding))
+
+        # decoder Embedding layer
+        self.specs.append(LayerSpec(EmbeddingPipeDec,
+                                    args.hidden_size,
+                                    args.padded_vocab_size,
+                                    args.max_position_embeddings,
+                                    args.hidden_dropout,
+                                    init_method=init_method,
+                                    num_tokentypes=num_tokentypes))
+
+        self.specs.append(lambda x: [transpose_hidden(x_i, i, args.fp32_residual_connection) for i, x_i in enumerate(x)])
+
+        # decoder
+        for layer_idx in range(args.num_layers):
+            self.specs.append(
+                LayerSpec(ParallelTransformerLayerPipeDec,
+                    init_method=init_method,
+                    output_layer_init_method=scaled_init_method,
+                    layer_number=layer_idx,
+                    layer_type=LayerType.decoder,
+                    self_attn_mask_type=AttnMaskType.padding))
+
+        self.specs.append(lambda x: [transpose_hidden(x_i, i, args.fp32_residual_connection) for i, x_i in enumerate(x)])
+
+        # lm head
+        self.specs.append(
+                LayerSpec(T5LMHeadPipe,
+                          args.padded_vocab_size,
+                          parallel_output))
+
+        from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
+        topo = PipeModelDataParallelTopology(num_pp=mpu.get_pipeline_model_parallel_world_size(),
+                                             num_mp=mpu.get_tensor_model_parallel_world_size(),
+                                             num_dp=mpu.get_data_parallel_world_size())
+
+        super().__init__(layers=self.specs,
+                         loss_fn=CrossEntropy,
+                         topology=topo,
+                         activation_checkpoint_interval=0,
+                         partition_method='type:transformer')
