@@ -1,0 +1,3 @@
+- 원 README는 https://github.com/moreh-dev/Megatron-DeepSpeed/blob/main/README.md.orig 를 참고
+- ROCm + Megatron-DeepSpeed 을 진행하는 경우
+  - `RDM` branch (https://github.com/moreh-dev/Megatron-DeepSpeed/tree/RDM) 를 참고하세요.
