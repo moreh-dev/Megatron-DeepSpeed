@@ -30,6 +30,7 @@ from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import T5Model, T5ModelPipe
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.model.utils import init_method_normal
 
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
@@ -55,23 +56,7 @@ def model_provider(pre_process=True, post_process=True):
             # We need to call model.set_batch_fn after deepspeed.initialize
             model._megatron_batch_fn = get_batch_pipe
 
-            # Predompute the attention mask and store it in args. This avoids having to
-            # pipeline it as an activation during training. The mask is constant, and thus
-            # we can reuse it.
-            attention_mask = torch.tril(torch.ones(
-                (1, args.encoder_seq_length, args.encoder_seq_length), device=torch.cuda.current_device())).view(
-                    1, 1, args.encoder_seq_length, args.encoder_seq_length)
-
-            # Convert attention mask to binary:
-            attention_mask = (attention_mask < 0.5)
-            if args.fp16:
-                attention_mask = attention_mask.half()
-            elif args.bf16:
-                attention_mask = attention_mask.bfloat16()
-
-            # Attention mask must be bool.
-            args.attn_mask = attention_mask.to(torch.bool)
-
+            model.initialize_word_embeddings(init_method_normal)
         else:
             model = T5Model(num_tokentypes=0,
                             parallel_output=True)

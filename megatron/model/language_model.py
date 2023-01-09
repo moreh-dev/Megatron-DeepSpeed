@@ -288,7 +288,7 @@ class EmbeddingPipe(Embedding):
         """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
         return self.word_embeddings.weight
 
-class EmbeddingPipeEnc(Embedding):
+class EmbeddingPipeEncDec(Embedding):
 
     def forward(self, inputs, **kwargs):
         if not hasattr(self, '_args'):
@@ -304,41 +304,22 @@ class EmbeddingPipeEnc(Embedding):
         enc_dec_mask = inputs[7]
 
         embeddings = super().forward(input_ids, position_ids, tokentype_ids=None)
+        dec_embeddings = super().forward(dec_input_ids, dec_position_ids, tokentype_ids=None)
 
-        return embeddings, enc_mask, dec_input_ids, dec_position_ids, labels, dec_mask, enc_dec_mask
+        # TODO transpose
+        if self._args.fp32_residual_connection:
+            embeddings = embeddings.transpose(0, 1).contiguous().float()
+            dec_embeddings = dec_embeddings.transpose(0, 1).contiguous().float()
+        else:
+            embeddings = embeddings.transpose(0, 1).contiguous()
+            dec_embeddings = dec_embeddings.transpose(0, 1).contiguous()
 
-
-    @property
-    def enc_word_embeddings_weight(self):
-        """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
-        return self.word_embeddings.weight
-
-class EmbeddingPipeDec(Embedding):
-    '''
-    hidden, attention_mask, dec_input_ids, dec_position_ids, labels, dec_mask, enc_dec_mask
-    '''
-
-    def forward(self, inputs, **kwargs):
-        if not hasattr(self, '_args'):
-            self._args = get_args()
-
-        enc_output = inputs[0]
-        _ = inputs[1] # enc attention mask
-        input_ids = inputs[2]
-        position_ids = inputs[3]
-        labels = inputs[4]
-        dec_mask = inputs[5]
-        enc_dec_mask = inputs[6]
-
-        embeddings = super().forward(input_ids, position_ids, tokentype_ids=None)
-
-        return embeddings, enc_output, dec_mask, enc_dec_mask, labels
+        return embeddings, enc_mask, dec_embeddings, dec_mask, enc_dec_mask
 
     @property
-    def dec_word_embeddings_weight(self):
+    def word_embeddings_weight(self):
         """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
         return self.word_embeddings.weight
-
 
 class TransformerLanguageModel(MegatronModule):
     """Transformer language model.

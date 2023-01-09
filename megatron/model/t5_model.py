@@ -16,6 +16,7 @@
 """T5 model."""
 
 import torch
+import functools
 
 from deepspeed import comm as dist
 from megatron import (
@@ -32,7 +33,7 @@ from megatron.model.utils import (
     scaled_init_method_normal
 )
 from .module import MegatronModule, fp32_to_float16
-from .language_model import EmbeddingPipe, EmbeddingPipeEnc, EmbeddingPipeDec
+from .language_model import EmbeddingPipe, EmbeddingPipeEncDec
 from .transformer import ParallelTransformerLayerPipe, ParallelTransformerLayerPipeEnc, ParallelTransformerLayerPipeDec
 
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
@@ -68,13 +69,13 @@ class T5LMHeadPipe(MegatronModule):
     """
 
 
-    def __init__(self, mpu_vocab_size, parallel_output):
+    def __init__(self, mpu_vocab_size, parallel_output, word_embeddings_weight_func):
         super(T5LMHeadPipe, self).__init__()
 
         args = get_args()
 
         # create it's own weight and sync in every step
-        self.weight = torch.nn.Parameter(torch.randn(mpu_vocab_size, args.hidden_size))
+        self.weight_func = word_embeddings_weight_func
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias.model_parallel = True
         self.bias.partition_dim = 0
@@ -82,10 +83,10 @@ class T5LMHeadPipe(MegatronModule):
         self.parallel_output = parallel_output
 
     def forward(self, inputs):
-        # hidden, enc_output, attention_mask, enc_dec_mask, labels
-        hidden_states, _, _, _, _ = inputs
+        # hidden, enc_output, attention_mask, enc_dec_mask
+        hidden_states, _, _, _ = inputs
         output = parallel_lm_logits(hidden_states,
-                                    self.weight,
+                                    self.weight_func(),
                                     self.parallel_output,
                                     bias=self.bias)
         return output
@@ -221,8 +222,71 @@ def CrossEntropy(output, labels):
     loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
     return loss.sum()
 
+class DummyLanguageModel():
+    def __init__(self):
+        self.embedding = None
+
 class T5ModelPipe(PipelineModule,MegatronModule):
     """T5 Language model."""
+
+    def initialize_word_embeddings(self, init_method_normal):
+        args = get_args()
+        if not self.share_word_embeddings:
+            raise Exception('initialize_word_embeddings() was called but '
+                            'share_word_embeddings is false')
+
+        # This function just initializes the word embeddings in the final stage
+        # when we are using pipeline parallelism. If we aren't using pipeline
+        # parallelism there is nothing to do.
+        if args.pipeline_model_parallel_size == 1:
+            return
+
+        # Parameters are shared between the word embeddings layer, and the
+        # heads at the end of the model. In a pipelined setup with more than
+        # one stage, the initial embedding layer and the head are on different
+        # workers, so we do the following:
+        # 1. Create a second copy of word_embeddings on the last stage, with
+        #    initial parameters of 0.0.
+        # 2. Do an all-reduce between the first and last stage to ensure that
+        #    the two copies of word_embeddings start off with the same
+        #    parameter values.
+        # 3. In the training loop, before an all-reduce between the grads of
+        #    the two word_embeddings layers to ensure that every applied weight
+        #    update is the same on both stages.
+        if mpu.is_pipeline_last_stage():
+            assert not mpu.is_pipeline_first_stage()
+            self._word_embeddings_for_head_key = 'word_embeddings_for_head'
+            # set word_embeddings weights to 0 here, then copy first
+            # stage's weights using all_reduce below.
+            self.word_embeddings = mpu.VocabParallelEmbedding(
+                args.padded_vocab_size, args.hidden_size,
+                init_method=init_method_normal(args.init_method_std))
+            self.word_embeddings.weight.data.fill_(0)
+            self.word_embeddings.weight.shared = True
+
+        # Ensure that first and last stages have the same initial parameter
+        # values.
+        if torch.distributed.is_initialized():
+            if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
+                torch.distributed.all_reduce(self.word_embeddings_weight(None).data,
+                                             group=mpu.get_embedding_group())
+        else:
+            print("WARNING! Distributed processes aren't initialized, so "
+                  "word embeddings in the last layer are not initialized. "
+                  "If you are just manipulating a model this is fine, but "
+                  "this needs to be handled manually. If you are training "
+                  "something is definitely wrong.")
+
+    def word_embeddings_weight(self, self2):
+        if mpu.is_pipeline_first_stage(ignore_virtual=True):
+            return self.tied_modules['embedding'].word_embeddings.weight
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if not self.share_word_embeddings:
+                raise Exception('word_embeddings_weight() called for last '
+                                'stage, but share_word_embeddings is false')
+            return self.word_embeddings.weight
+        raise Exception('word_embeddings_weight() should be '
+                        'called for first and last stage only')
 
     def __init__(self, num_tokentypes=0, parallel_output=True):
         args = get_args()
@@ -234,6 +298,15 @@ class T5ModelPipe(PipelineModule,MegatronModule):
 
         self.specs = []
 
+        self.embedding = TiedLayerSpec('embedding',
+                                       EmbeddingPipeEncDec,
+                                       args.hidden_size,
+                                       args.padded_vocab_size,
+                                       args.max_position_embeddings,
+                                       args.hidden_dropout,
+                                       init_method=init_method,
+                                       num_tokentypes=num_tokentypes,
+                                       tied_weight_attr='word_embeddings_weight')
         '''
         def _to_float16(inputs):
             if args.fp16:
@@ -245,15 +318,9 @@ class T5ModelPipe(PipelineModule,MegatronModule):
         self.specs.append(_to_float16)
         '''
 
-        # encoder Embedding layer
-        self.specs.append(LayerSpec(EmbeddingPipeEnc,
-                                    args.hidden_size,
-                                    args.padded_vocab_size,
-                                    args.max_position_embeddings,
-                                    args.hidden_dropout,
-                                    init_method=init_method,
-                                    num_tokentypes=num_tokentypes))
-        #self.specs.append(self.encoder_embedding)
+        # encoder-decoder embedding layer
+        self.specs.append(self.embedding)
+        self.share_word_embeddings = True
 
         def transpose_hidden(x_i, i, fp32_residual_connection):
             if i == 0:
@@ -264,8 +331,6 @@ class T5ModelPipe(PipelineModule,MegatronModule):
             else:
                 return x_i
 
-        self.specs.append(lambda x: [transpose_hidden(x_i, i, args.fp32_residual_connection) for i, x_i in enumerate(x)])
-
         # encoder
         for layer_idx in range(args.num_layers):
             self.specs.append(
@@ -275,16 +340,12 @@ class T5ModelPipe(PipelineModule,MegatronModule):
                     layer_number=layer_idx,
                     self_attn_mask_type=AttnMaskType.padding))
 
-        # decoder Embedding layer
-        self.specs.append(LayerSpec(EmbeddingPipeDec,
-                                    args.hidden_size,
-                                    args.padded_vocab_size,
-                                    args.max_position_embeddings,
-                                    args.hidden_dropout,
-                                    init_method=init_method,
-                                    num_tokentypes=num_tokentypes))
-
-        self.specs.append(lambda x: [transpose_hidden(x_i, i, args.fp32_residual_connection) for i, x_i in enumerate(x)])
+        '''
+        encoder_output, enc_mask, dec_embeddings, dec_mask, enc_dec_mask
+        ---->
+        dec_embeddings, encoder_output, dec_mask, enc_dec_mask
+        '''
+        self.specs.append(lambda x: (x[2], x[0], x[3], x[4]))
 
         # decoder
         for layer_idx in range(args.num_layers):
@@ -302,7 +363,8 @@ class T5ModelPipe(PipelineModule,MegatronModule):
         self.specs.append(
                 LayerSpec(T5LMHeadPipe,
                           args.padded_vocab_size,
-                          parallel_output))
+                          parallel_output,
+                          functools.partial(self.word_embeddings_weight, self)))
 
         from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
         topo = PipeModelDataParallelTopology(num_pp=mpu.get_pipeline_model_parallel_world_size(),

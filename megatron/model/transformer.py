@@ -603,9 +603,6 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
         else:
             raise RuntimeError('Received more inputs than understood.')
 
-'''
-embeddings, enc_mask, dec_input_ids, dec_position_ids, labels, dec_mask, enc_dec_mask
-'''
 class ParallelTransformerLayerPipeEnc(ParallelTransformerLayer):
     """Extends ParallelTransformerLayer to forward attention_mask through the pipeline.
 
@@ -627,14 +624,17 @@ class ParallelTransformerLayerPipeEnc(ParallelTransformerLayer):
        for the mask and only return `super().forward(...)`
     """
     def forward(self, inputs, **kwargs):
-        if len(inputs) != 7:
+        '''
+        embeddings, enc_mask, dec_embeddings, dec_mask, enc_dec_mask
+        '''
+        if len(inputs) != 5:
             raise RuntimeError(f'Received more inputs than understood. {len(inputs)}')
         # Attention mask is an activation.
-        hidden_states, attention_mask, dec_input_ids, dec_position_ids, labels, dec_mask, enc_dec_mask = \
-            inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6]
+        hidden_states, attention_mask, dec_hidden_states, dec_mask, enc_dec_mask = \
+            inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]
         # HACK: currently MoE model does not support pipeline parallel, so
         # here we just ignore the moe_loss returned by forward()
-        return (super().forward(hidden_states, attention_mask, **kwargs)[0], attention_mask, dec_input_ids, dec_position_ids, labels, dec_mask, enc_dec_mask)
+        return (super().forward(hidden_states, attention_mask, **kwargs)[0], attention_mask, dec_hidden_states, dec_mask, enc_dec_mask)
 
 class ParallelTransformerLayerPipeDec(ParallelTransformerLayer):
     """Extends ParallelTransformerLayer to forward attention_mask through the pipeline.
@@ -657,11 +657,14 @@ class ParallelTransformerLayerPipeDec(ParallelTransformerLayer):
        for the mask and only return `super().forward(...)`
     """
     def forward(self, inputs, **kwargs):
-        if len(inputs) != 5:
+        '''
+        dec_embeddings, enc_output, dec_mask, enc_dec_mask
+        '''
+        if len(inputs) != 4:
             raise RuntimeError(f'Received more inputs than understood. {len(inputs)}')
-        hiddens, enc_output, attention_mask, enc_dec_mask, labels = inputs
+        hiddens, enc_output, attention_mask, enc_dec_mask = inputs
 
-        return (super().forward(hiddens, attention_mask, encoder_output = enc_output, enc_dec_attn_mask = enc_dec_mask, **kwargs)[0], enc_output, attention_mask, enc_dec_mask, labels)
+        return super().forward(hiddens, attention_mask, encoder_output = enc_output, enc_dec_attn_mask = enc_dec_mask, **kwargs)[0], enc_output, attention_mask, enc_dec_mask
 
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
