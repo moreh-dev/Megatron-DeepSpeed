@@ -32,6 +32,12 @@
         * 노드가 156대 이상 있어, 대역이 부족하다면 100이 아닌 1번을 마스터 노드로 할당하고 그보다 더 부족하다면, subnet mask를 16으로 바꾸는 등 설정이 필요합니다.
     * home 어딘가에 `hostname:docker_ip` dictionary를 두고 `bashrc` 에서 해당 파일을 읽어 `MY_IP`를 export 하는 방식을 추천드립니다. 
 4. 노드 별로 `./scripts/run_docker.sh` script를 실행합니다.
+    * 스크립트의 volume 인자를 본인 local의 해당 repo에 접근 가능하도록 주어야 합니다.
     * 사용이 끝난 뒤엔 노드 별로 `./scripts/clean_docker.sh` script를 실행해 모든 컨테이너를 내려줍니다.
-    
-##
+
+## Prepare dataset
+### T5, GPT 공통
+* `dataset/download_book.sh` 와 `dataset/download_vocab.sh` 를 실행합니다.
+
+
+## Run
