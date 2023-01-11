@@ -16,7 +16,7 @@
     * 해당 스크립트는 다음과 같은 작업을 합니다.
     1. 아래와 같은 docker image들을 설치합니다.
         1. `rocm/pytorch`
-            * (aiot cluster `/home/jeesoo/jira/rocm_pytorch` file을 load 합니다. 다른 cluster에서 setup하는 경우 주의)
+            * (aiot cluster `/home/jeesoo/jira/rocm_pytorch_modified` file을 load 합니다. 다른 cluster에서 setup하는 경우 주의)
         2. `rdma/sriov-plugin`
         3. `rdma/container_tools_installer`
     2. `rdma/container_tools_installer`container를 실행해 sriov 사용 가능한 docker command를 설치합니다.
