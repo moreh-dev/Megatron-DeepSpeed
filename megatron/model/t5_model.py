@@ -25,7 +25,7 @@ from megatron import (
 )
 from megatron.model.enums import AttnMaskType, LayerType
 from megatron.model.language_model import parallel_lm_logits, get_language_model
-from megatron.model.transformer import LayerNorm
+from megatron.model.transformer import LayerNorm, LayerNormEnc, LayerNormDec
 from megatron.model.utils import (
     openai_gelu,
     get_linear_layer,
@@ -222,10 +222,6 @@ def CrossEntropy(output, labels):
     loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
     return loss.sum()
 
-class DummyLanguageModel():
-    def __init__(self):
-        self.embedding = None
-
 class T5ModelPipe(PipelineModule,MegatronModule):
     """T5 Language model."""
 
@@ -340,6 +336,12 @@ class T5ModelPipe(PipelineModule,MegatronModule):
                     layer_number=layer_idx,
                     self_attn_mask_type=AttnMaskType.padding))
 
+        # Final layernorm after transformer layers
+        self.specs.append(
+            LayerSpec(LayerNormEnc,
+                      args.hidden_size,
+                      eps=args.layernorm_epsilon))
+
         '''
         encoder_output, enc_mask, dec_embeddings, dec_mask, enc_dec_mask
         ---->
@@ -357,7 +359,11 @@ class T5ModelPipe(PipelineModule,MegatronModule):
                     layer_type=LayerType.decoder,
                     self_attn_mask_type=AttnMaskType.padding))
 
-        self.specs.append(lambda x: [transpose_hidden(x_i, i, args.fp32_residual_connection) for i, x_i in enumerate(x)])
+        # Final layernorm after transformer layers
+        self.specs.append(
+            LayerSpec(LayerNormDec,
+                      args.hidden_size,
+                      eps=args.layernorm_epsilon))
 
         # lm head
         self.specs.append(

@@ -60,6 +60,7 @@ def model_provider(pre_process=True, post_process=True):
         else:
             model = T5Model(num_tokentypes=0,
                             parallel_output=True)
+    print_rank_0(model)
     return model
 
 def t5_extended_attention_mask(attention_mask_list):

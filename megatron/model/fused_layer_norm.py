@@ -88,3 +88,16 @@ class MixedFusedLayerNorm(torch.nn.Module):
     return FusedLayerNormAffineFunction.apply(
       input, self.weight, self.bias, self.normalized_shape,self.eps)
 
+class MixedFusedLayerNormEnc(MixedFusedLayerNorm):
+  def forward(self, inputs):
+    # after encoder: encoder_output, enc_mask, dec_embeddings, dec_mask, enc_dec_mask
+    hidden = inputs[0].transpose(0, 1).contiguous()
+    return (super().forward(hidden).transpose(0, 1).contiguous(), *inputs[1:])
+
+
+class MixedFusedLayerNormDec(MixedFusedLayerNorm):
+  def forward(self, inputs):
+    # after decoder: dec_embeddings, encoder_output, dec_mask, enc_dec_mask
+    hidden = inputs[0].transpose(0, 1).contiguous()
+    return (super().forward(hidden).contiguous(), *inputs[1:])
+

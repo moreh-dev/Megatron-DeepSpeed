@@ -17,7 +17,7 @@ HF=$PWD/hostfile
 # Disabling tensor/pipeline parallelism
 
 TP=1
-PP=2
+PP=5
 
 # HEADS ~= HIDDEN/128
 
@@ -29,13 +29,13 @@ KV_CHANNELS=64
 FFN_HIDDEN_SIZE=10880
 SEQ=512
 
-NODES=8
+NODES=40
 GPN=8
 
-MICRO_BATCH=1
+MICRO_BATCH=5
 
 GRAD_ACC_STEP=170
-GLOBAL_BATCH=$(( (${GPN} / ${PP} / ${TP})  * ${MICRO_BATCH} * ${NODES} * ${GRAD_ACC_STEP}))
+GLOBAL_BATCH=$(( (${GPN} * ${NODES} / ${PP} / ${TP})  * ${MICRO_BATCH} * ${GRAD_ACC_STEP}))
 
 # Initial power scale for loss
 SP=15

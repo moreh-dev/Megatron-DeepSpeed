@@ -14,6 +14,8 @@
 # limitations under the License.
 
 from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+from .fused_layer_norm import MixedFusedLayerNormEnc as LayerNormEnc
+from .fused_layer_norm import MixedFusedLayerNormDec as LayerNormDec
 
 from .distributed import DistributedDataParallel
 from .bert_model import BertModel
